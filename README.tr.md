@@ -72,7 +72,7 @@ Başlık, varsa *Ringbearer* fontunu kullanır. Font depoya **eklenmemiştir** (
 - Kayıtlı zamanlayıcı yalnızca sistem açılış zamanı eşleşirse sürdürülür; yeniden başlatma sonrası sürpriz kapanma olmaz.
 
 ## Kaldırma
-Panelin ayarlarından *Windows ile Başla*'yı kapat, tepsi menüsünden çık, `moria.exe`'yi sil.
+Panelin ayarlarından *Windows ile Başla*'yı kapat, tepsi menüsünden çık, `MoriaS.exe`'yi sil.
 İstersen `HKCU\Software\MORIA` anahtarını da sil.
 
 ## Proje yapısı
