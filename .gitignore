@@ -1,0 +1,23 @@
+# Derleme çıktıları
+build/
+out/
+cmake-build-*/
+*.obj
+*.o
+*.exe
+*.pdb
+*.ilk
+*.res
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Yazı tipi dosyaları depoya EKLENMEZ (lisansı ayrı; README'ye bakın)
+*.ttf
+*.otf
+
+# Python
+__pycache__/
