@@ -74,7 +74,7 @@ falls back to Georgia.
 - A saved timer is resumed only if the system boot time matches, so a reboot never triggers a surprise shutdown.
 
 ## Uninstall
-Turn off *Run at Startup* in the panel's settings, exit from the tray menu, delete `moria.exe`.
+Turn off *Run at Startup* in the panel's settings, exit from the tray menu, delete `MoriaS.exe`.
 Optionally remove `HKCU\Software\MORIA`.
 
 ## Project layout
