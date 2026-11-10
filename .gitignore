@@ -21,3 +21,9 @@ cmake-build-*/
 
 # Python
 __pycache__/
+
+# Kök dizindeki serbest kopyalar (kaynaklar src/ ve res/ altındadır)
+/door_art.h
+/main.cpp
+/resource.rc
+/icon.ico

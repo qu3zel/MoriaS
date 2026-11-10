@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(moria VERSION 1.0.0 LANGUAGES CXX RC)
+project(moria VERSION 1.1.0 LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,7 +12,7 @@ add_executable(moria WIN32
 
 target_include_directories(moria PRIVATE src res)
 target_compile_definitions(moria PRIVATE UNICODE _UNICODE)
-target_link_libraries(moria PRIVATE user32 gdi32 shell32 advapi32)
+target_link_libraries(moria PRIVATE user32 gdi32 shell32 advapi32 gdiplus comctl32 winmm)
 
 if(MSVC)
     # Kaynaklar UTF-8 (Türkçe karakterler için /utf-8 şart).

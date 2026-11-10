@@ -1,11 +1,14 @@
 #include <winver.h>
 
 1 ICON "moria.ico"
+
+#ifndef __GNUC__
 1 24 "moria.manifest"
+#endif
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,0,0,0
- PRODUCTVERSION 1,0,0,0
+ FILEVERSION 1,1,0,0
+ PRODUCTVERSION 1,1,0,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -18,12 +21,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "MORIA contributors"
             VALUE "FileDescription", "M.O.R.I.A. - Doors of Durin sleep timer"
-            VALUE "FileVersion", "1.0.0.0"
+            VALUE "FileVersion", "1.1.0.0"
             VALUE "InternalName", "moria"
             VALUE "LegalCopyright", "MIT License"
             VALUE "OriginalFilename", "moria.exe"
             VALUE "ProductName", "M.O.R.I.A."
-            VALUE "ProductVersion", "1.0.0"
+            VALUE "ProductVersion", "1.1.0"
         END
     END
     BLOCK "VarFileInfo"

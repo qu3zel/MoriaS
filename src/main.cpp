@@ -20,6 +20,8 @@
 #endif
 #include <windows.h>
 #include <windowsx.h>
+#include <commctrl.h>
+#include <mmsystem.h>
 #include <shellapi.h>
 #include <string>
 #include <stdio.h>
@@ -29,24 +31,37 @@
 #include <math.h>
 #include <cmath>
 
+// ---------------------------------------------------------------- Yerleşim (taban birimler, DPI ile çarpılır)
+static const int W_BASE = 360;
+static const int H_COL = 480;        // ayarlar kapalıyken yükseklik
+static const int H_EXP = 612;        // ayarlar açıkken yükseklik
+static const int Y_TITLE = 112, Y_SUB = 152, Y_TIME = 174, Y_BAR = 228, Y_STATUS = 236;
+static const int Y_CHIPS = 266, Y_LABEL = 296, Y_EDIT = 322, Y_ACTION = 366, Y_SETBTN = 418;
+static const int Y_SEP = 450, Y_LANG = 458, Y_START = 492, Y_OPLBL = 526, Y_OPSLIDER = 556;
+static const int PRESETS[5] = { 15, 30, 45, 60, 90 };
+
 #include "door_art.h"
 
 #ifdef _MSC_VER
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "advapi32.lib")
 #endif
 
 // ---------------------------------------------------------------- Renkler
-#define COLOR_BG RGB(12, 18, 24)
-#define COLOR_HOVER_BG RGB(24, 38, 52)
+#define COLOR_CHROMA RGB(1, 2, 3)    // Donanımsal DWM şeffaf anahtar rengi (0ms gecikmeli maskeleme)
+#define COLOR_BG RGB(10, 16, 22)
+#define COLOR_HOVER_BG RGB(22, 38, 54)
 #define COLOR_ITHILDIN RGB(135, 225, 255)
 #define COLOR_RED RGB(255, 90, 80)
 #define COLOR_AMBER RGB(255, 150, 70)
-#define COLOR_TEXT RGB(210, 235, 255)
-#define COLOR_MUTED RGB(60, 90, 120)
-#define COLOR_BTN_BG RGB(16, 26, 36)
+#define COLOR_TEXT RGB(215, 240, 255)
+#define COLOR_MUTED RGB(68, 104, 136)
+#define COLOR_BTN_BG RGB(14, 23, 32)
 
 // ---------------------------------------------------------------- Kimlikler
 #define ID_INPUT 101
@@ -72,15 +87,6 @@
 
 #define MAX_MINUTES 43200            // 30 gün
 
-// ---------------------------------------------------------------- Yerleşim (taban birimler, DPI ile çarpılır)
-static const int W_BASE = 360;
-static const int H_COL = 480;        // ayarlar kapalıyken yükseklik
-static const int H_EXP = 612;        // ayarlar açıkken yükseklik
-static const int Y_TITLE = 104, Y_SUB = 150, Y_TIME = 174, Y_BAR = 230, Y_STATUS = 238;
-static const int Y_CHIPS = 268, Y_LABEL = 304, Y_EDIT = 322, Y_ACTION = 364, Y_SETBTN = 420;
-static const int Y_SEP = 452, Y_LANG = 460, Y_START = 494, Y_OPLBL = 530, Y_OPSLIDER = 562;
-static const int PRESETS[5] = { 15, 30, 45, 60, 90 };
-
 // ---------------------------------------------------------------- Genel durum
 HWND hMain = NULL, hInput = NULL, hBtnAction = NULL, hBtnSettings = NULL, hBtnLang = NULL, hBtnStartup = NULL;
 HWND hChip[5] = {};
@@ -88,23 +94,111 @@ HFONT hFontTitle = NULL, hFontTime = NULL, hFontEdit = NULL, hFontMed = NULL, hF
 HICON hIconIdle = NULL, hIconActive = NULL, hIconBig = NULL;
 NOTIFYICONDATAW nid = {};
 
+// ---------------------------------------------------------------- Önbellekli Statik Kapı Mimari Katmanı
+static HDC g_artCacheDC = NULL;
+static HBITMAP g_artCacheBmp = NULL;
+static HGDIOBJ g_artCacheOld = NULL;
+static int g_artCacheW = 0, g_artCacheH = 0;
+static float g_artCacheS = 0.0f;
+
+static void FreeArtCache() {
+    if (g_artCacheDC) {
+        if (g_artCacheOld) SelectObject(g_artCacheDC, g_artCacheOld);
+        DeleteDC(g_artCacheDC);
+        g_artCacheDC = NULL;
+        g_artCacheOld = NULL;
+    }
+    if (g_artCacheBmp) {
+        DeleteObject(g_artCacheBmp);
+        g_artCacheBmp = NULL;
+    }
+    g_artCacheW = 0; g_artCacheH = 0; g_artCacheS = 0.0f;
+}
+
 int currentStatus = 0;               // 0 hazır, 1 sayıyor, 2 mellon, 3 iptal, 4 kapanıyor
 std::wstring statusText;
 bool isEnglish = false, isStartupEnabled = false, showSettings = false, isTimerActive = false;
+bool warnedOneMinute = false;
 int remainingSeconds = 0, totalSeconds = 0, lastMinutes = 60;
 time_t endTime = 0;
 int currentHoverId = 0;
-int opacityVal = 90;
+int opacityVal = 92;
 bool isDraggingOpacity = false;
 
 float dpiScale = 1.0f, g_s = 1.0f;
+float currentBaseH = (float)H_COL;   // yumuşak ayarlar açılış/kapanış yüksekliği
+double expandStartMs = 0.0;
+float expandFromH = (float)H_COL, expandToH = (float)H_COL;
+bool isExpandingAnim = false;
+double rippleStartMs = 0.0;          // "mellon" veya başlatma ışık dalgası zamanı
+float btnHoverBlend[20] = {};        // buton yumuşak hover geçişi (0..1)
+
 POINT anchorPt = { 0, 0 };
 bool flyoutVisible = false;
-ULONGLONG lastHideTick = 0, animStart = 0;
+ULONGLONG lastHideTick = 0;
+double animStartMs = 0.0;
 int animTx = 0, animTy = 0, animOffX = 0, animOffY = 0;
 UINT g_msgTaskbarCreated = 0;
 std::wstring fontPath;
 bool haveRingbearer = false;
+bool g_highResTimerActive = false;
+
+// Yüksek çözünürlüklü (mikrosaniye hassasiyetli) zamanlayıcı
+static double NowMs() {
+    static LARGE_INTEGER freq = {};
+    if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER cnt;
+    QueryPerformanceCounter(&cnt);
+    return (double)cnt.QuadPart * 1000.0 / (double)freq.QuadPart;
+}
+
+// Aktif monitörün yenileme hızına (Hz) uygun milisaniye adımı (60Hz -> 15ms, 144Hz -> 6ms, 240Hz -> 4ms)
+static UINT GetMonitorFrameIntervalMs() {
+    DEVMODEW dm = {};
+    dm.dmSize = sizeof(dm);
+    int hz = 60;
+    if (EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 30)
+        hz = (int)dm.dmDisplayFrequency;
+    if (hz > 240) hz = 240;
+    UINT ms = (UINT)(1000 / hz);
+    if (ms < 4) ms = 4;
+    if (ms > 15) ms = 15;
+    return ms;
+}
+
+static void SetHighResTimer(bool enable) {
+    if (enable && !g_highResTimerActive) {
+        timeBeginPeriod(1);
+        g_highResTimerActive = true;
+    } else if (!enable && g_highResTimerActive) {
+        timeEndPeriod(1);
+        g_highResTimerActive = false;
+    }
+}
+
+static int HoverSlot(int id) {
+    if (id == ID_BTN_ACTION) return 0;
+    if (id == ID_BTN_SETTINGS) return 1;
+    if (id == ID_BTN_LANG) return 2;
+    if (id == ID_BTN_STARTUP) return 3;
+    if (id >= ID_CHIP0 && id < ID_CHIP0 + 5) return 4 + (id - ID_CHIP0);
+    return -1;
+}
+
+static COLORREF LerpColor(COLORREF a, COLORREF b, float t) {
+    if (t <= 0.0f) return a;
+    if (t >= 1.0f) return b;
+    int r = (int)(GetRValue(a) + (GetRValue(b) - GetRValue(a)) * t + 0.5f);
+    int g = (int)(GetGValue(a) + (GetGValue(b) - GetGValue(a)) * t + 0.5f);
+    int bl = (int)(GetBValue(a) + (GetBValue(b) - GetBValue(a)) * t + 0.5f);
+    return RGB(r, g, bl);
+}
+
+// Buton alt-sınıfı: WM_ERASEBKGND mesajını bastırarak beyaz flicker'ı tamamen engeller
+static LRESULT CALLBACK BtnNoFlickerProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR) {
+    if (m == WM_ERASEBKGND) return 1;
+    return DefSubclassProc(h, m, w, l);
+}
 
 static bool FontAvailable(const wchar_t* face) {
     HDC dc = GetDC(NULL);
@@ -121,12 +215,34 @@ static bool FontAvailable(const wchar_t* face) {
 
 static inline int PX(float v) { return (int)(v * g_s + 0.5f); }
 
+// Statik kapı mimarisi katmanını önbelleğe çiz (sadece ilk açılışta 1 kez çalışır)
+static void EnsureArtCache(HDC refDC, int w, int h, float s) {
+    if (g_artCacheDC && g_artCacheW == w && g_artCacheH == h && fabsf(g_artCacheS - s) < 0.001f)
+        return;
+
+    FreeArtCache();
+    g_artCacheDC = CreateCompatibleDC(refDC);
+    g_artCacheBmp = CreateCompatibleBitmap(refDC, w, h);
+    g_artCacheOld = SelectObject(g_artCacheDC, g_artCacheBmp);
+    g_artCacheW = w; g_artCacheH = h; g_artCacheS = s;
+
+    // 1. Prosedürel Moria Kaya Dokusu (32-bit DIB — taş damarları ve ay ışığı vinyeti)
+    RenderRockTextureDIB(g_artCacheDC, w, h, s);
+
+    // 2. Filmdeki Durin'in Kapıları Mimari Çizimi (Çok katmanlı GDI+ Ithildin ışıması)
+    Gdiplus::Graphics g(g_artCacheDC);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+    DrawMovieAccurateMoriaDoor(g, s, w, h);
+}
+
 // =====================================================================
 //  DİL / METİN
 // =====================================================================
 enum {
     S_SUB, S_START, S_CANCEL, S_SETTINGS, S_LANG, S_STARTUP, S_MINLABEL, S_CLOSEAT, S_OPACITY, S_UNIT,
     S_M_OPEN, S_M_CANCEL, S_M_EXIT, S_EXIT_Q, S_READY, S_MELLON, S_CANCELLED, S_CLOSING, S_TIPREADY, S_TIPLEFT,
+    S_WARN_TITLE, S_WARN_MSG,
     S_COUNT
 };
 
@@ -151,7 +267,10 @@ static const wchar_t* STR[S_COUNT][2] = {
     { L"Protokol iptal edildi. Kapılar açık.", L"Protocol cancelled. Doors remain open." },
     { L"Kapılar kapanıyor...", L"The doors are closing..." },
     { L"M.O.R.I.A. - Hazır", L"M.O.R.I.A. - Ready" },
-    { L"M.O.R.I.A. - Kalan: ", L"M.O.R.I.A. - Left: " }
+    { L"M.O.R.I.A. - Kalan: ", L"M.O.R.I.A. - Left: " },
+    { L"M.O.R.I.A. - Durin'in Kapıları", L"M.O.R.I.A. - Doors of Durin" },
+    { L"Kapıların kapanmasına 1 dakika kaldı.\nİptal etmek için simgeye tıklayın.",
+      L"1 minute left until the doors close.\nClick the icon to cancel." }
 };
 
 static std::wstring Tr(int id) { return STR[id][isEnglish ? 1 : 0]; }
@@ -195,7 +314,6 @@ static void UpdateStatusText() {
     }
 }
 
-// Giriş kutusundan dakika oku (geçersizse 60). 'mellon' ise isMellon=true.
 static int ReadMinutesFromEdit(bool* isMellon) {
     wchar_t buf[32] = {};
     if (hInput) GetWindowTextW(hInput, buf, 32);
@@ -229,7 +347,6 @@ static void RunCommandSilent(const std::wstring& cmd) {
     }
 }
 
-// shutdown.exe'yi System32'den tam yolla çağır (PATH/çalışma dizini hilelerine karşı)
 static void RunShutdown(const std::wstring& args) {
     wchar_t sysDir[MAX_PATH] = {};
     UINT n = GetSystemDirectoryW(sysDir, MAX_PATH);
@@ -237,7 +354,6 @@ static void RunShutdown(const std::wstring& args) {
     RunCommandSilent(L"\"" + exe + L"\" " + args);
 }
 
-// Eski sürümlerden (FridayUyku) ayarları ve Windows ile başlatma kaydını taşır
 static void MigrateLegacySettings() {
     HKEY hNew;
     DWORD disp = 0;
@@ -272,7 +388,6 @@ static void MigrateLegacySettings() {
 
 static void LoadSettings() {
     MigrateLegacySettings();
-    // İlk çalıştırmada sistem diline göre varsayılan dil
     isEnglish = (PRIMARYLANGID(GetUserDefaultUILanguage()) != LANG_TURKISH);
     HKEY hKey;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\MORIA", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
@@ -310,11 +425,8 @@ static void SaveSettings() {
     }
 }
 
-// Çalışan geri sayımı kaydet: uygulama kapanıp açılsa bile kaldığı yerden devam eder
-// Sistemin açılış zamanı damgası: bilgisayar yeniden başlatıldıysa eski geri sayım sürdürülmez
 static time_t BootStamp() { return time(NULL) - (time_t)(GetTickCount64() / 1000); }
 
-// Çalışan geri sayımı kaydet: uygulama kapanıp açılsa bile kaldığı yerden devam eder
 static void SavePending(bool active) {
     HKEY hKey;
     if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\MORIA", 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
@@ -350,7 +462,7 @@ static bool LoadPending() {
         }
         RegCloseKey(hKey);
     }
-    if (!ok) SavePending(false);     // bayat kaydı temizle
+    if (!ok) SavePending(false);
     return ok;
 }
 
@@ -360,7 +472,6 @@ static void ToggleStartupStatus() {
         if (!isStartupEnabled) {
             wchar_t path[MAX_PATH];
             GetModuleFileNameW(NULL, path, MAX_PATH);
-            // --tray: Windows ile açılınca panel görünmeden doğrudan tepsiye yerleşir
             std::wstring cmd = L"\"" + std::wstring(path) + L"\" --tray";
             if (RegSetValueExW(hKey, L"MORIA", 0, REG_SZ, (const BYTE*)cmd.c_str(),
                                (DWORD)((cmd.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS) isStartupEnabled = true;
@@ -383,21 +494,21 @@ static HICON MakeDoorIcon(int n, COLORREF glow) {
     HGDIOBJ oC = SelectObject(dcC, bmC), oM = SelectObject(dcM, bmM);
 
     RECT r = { 0, 0, n, n };
-    FillRect(dcM, &r, (HBRUSH)GetStockObject(WHITE_BRUSH));   // beyaz = saydam
+    FillRect(dcM, &r, (HBRUSH)GetStockObject(WHITE_BRUSH));
     FillRect(dcC, &r, (HBRUSH)GetStockObject(BLACK_BRUSH));
 
     float u = n / 32.0f;
     int x1 = (int)(5 * u), x2 = (int)(27 * u), yTop = (int)(3 * u), yBot = (int)(29 * u);
     int w = x2 - x1, yMid = yTop + w / 2;
 
-    {   // maske: kapı şekli opak
+    {
         HGDIOBJ ob = SelectObject(dcM, GetStockObject(BLACK_BRUSH));
         HGDIOBJ op = SelectObject(dcM, GetStockObject(BLACK_PEN));
         Ellipse(dcM, x1 - 1, yTop - 1, x2 + 1, yTop + w + 1);
         Rectangle(dcM, x1 - 1, yMid, x2 + 1, yBot + 1);
         SelectObject(dcM, op); SelectObject(dcM, ob);
     }
-    {   // renk: koyu dolgu + parlak çerçeve + küçük yıldız
+    {
         HBRUSH fill = CreateSolidBrush(COLOR_BG);
         HGDIOBJ ob = SelectObject(dcC, fill);
         HGDIOBJ op = SelectObject(dcC, GetStockObject(NULL_PEN));
@@ -442,6 +553,17 @@ static void UpdateTray() {
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
+static void ShowTrayBalloon(const std::wstring& title, const std::wstring& msg) {
+    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_INFO;
+    wcsncpy(nid.szInfoTitle, title.c_str(), 63);
+    nid.szInfoTitle[63] = 0;
+    wcsncpy(nid.szInfo, msg.c_str(), 255);
+    nid.szInfo[255] = 0;
+    nid.dwInfoFlags = NIIF_INFO;
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+}
+
 static void Refresh() {
     if (hMain && flyoutVisible) RedrawWindow(hMain, NULL, NULL, RDW_INVALIDATE | RDW_ALLCHILDREN);
 }
@@ -480,24 +602,43 @@ static Placement ComputePlacement(int w, int h) {
     return p;
 }
 
-// Küçük ekranlarda panel çalışma alanına sığacak şekilde otomatik küçülür
 static float ComputeScale() {
     RECT mr, wa;
     GetAnchorMonitor(&mr, &wa);
-    float baseH = (float)(showSettings ? H_EXP : H_COL);
-    float maxS = ((wa.bottom - wa.top) - 36.0f) / baseH;
+    float maxS = ((wa.bottom - wa.top) - 36.0f) / (float)H_EXP;
     float s = dpiScale;
     if (s > maxS) s = maxS;
     if (s < 0.6f) s = 0.6f;
     return s;
 }
 
-static void ApplyRegion(HWND hwnd, int w, int h) {
+// Bellek DC üzerinde kapı kemeri kırpma bölgesi oluşturur (DWM SetWindowRgn çağrısı yapmadan 0.01ms'de kırpar)
+static HRGN CreateDoorClipRgn(int w, int h) {
     HRGN a = CreateEllipticRgn(0, 0, w + 1, w + 1);
-    HRGN b = CreateRoundRectRgn(0, w / 2 - 30, w + 1, h + 1, 24, 24);
+    HRGN b = CreateRectRgn(0, w / 2, w + 1, h + 1);
     CombineRgn(a, a, b, RGN_OR);
     DeleteObject(b);
-    SetWindowRgn(hwnd, a, TRUE);     // bölgenin sahipliği sisteme geçer
+    return a;
+}
+
+static void SetOpacityLayered(HWND hwnd) {
+    SetLayeredWindowAttributes(hwnd, COLOR_CHROMA, (BYTE)((255 * opacityVal) / 100), LWA_ALPHA | LWA_COLORKEY);
+}
+
+static void UpdateWindowGeometry(HWND hwnd, bool reposition) {
+    if (!hwnd) return;
+    // Pencere yüzeyini her zaman tam (W_BASE x H_EXP) boyutta tutuyoruz;
+    // konumlandırmayı ise aktif kapı yüksekliğine (PX(currentBaseH)) göre yapıyoruz ki
+    // kapının alt eşiği her zaman görev çubuğunun (taskbar) hemen 12px üstüne otursun!
+    int wpx = PX((float)W_BASE), maxH = PX((float)H_EXP), curDoorH = PX(currentBaseH);
+    if (reposition && flyoutVisible) {
+        Placement pl = ComputePlacement(wpx, curDoorH);
+        animTx = pl.x; animTy = pl.y;
+        SetWindowPos(hwnd, HWND_TOPMOST, pl.x, pl.y, wpx, maxH, SWP_NOACTIVATE | SWP_NOCOPYBITS);
+    } else {
+        SetWindowPos(hwnd, NULL, 0, 0, wpx, maxH, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+    }
+    InvalidateRect(hwnd, NULL, FALSE);
 }
 
 static void UpdateLayout(HWND hwnd, bool reposition) {
@@ -508,7 +649,7 @@ static void UpdateLayout(HWND hwnd, bool reposition) {
         return CreateFontW(-(int)(h * s + 0.5f), 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                            OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH, face);
     };
-    HFONT nTitle = haveRingbearer ? mk(40, FW_NORMAL, L"Ringbearer") : mk(34, FW_BOLD, L"Georgia");
+    HFONT nTitle = haveRingbearer ? mk(38, FW_NORMAL, L"Ringbearer") : mk(32, FW_BOLD, L"Georgia");
     HFONT nTime = mk(44, FW_LIGHT, L"Segoe UI Light");
     HFONT nEdit = mk(20, FW_SEMIBOLD, L"Segoe UI");
     HFONT nMed = mk(15, FW_NORMAL, L"Georgia");
@@ -524,26 +665,15 @@ static void UpdateLayout(HWND hwnd, bool reposition) {
     if (hFontChip) DeleteObject(hFontChip);
     hFontTitle = nTitle; hFontTime = nTime; hFontEdit = nEdit; hFontMed = nMed; hFontSmall = nSmall; hFontChip = nChip;
 
-    MoveWindow(hInput, PX(130), PX((float)Y_EDIT), PX(100), PX(28), TRUE);
+    MoveWindow(hInput, PX(144), PX((float)Y_EDIT), PX(72), PX(26), TRUE);
     for (int i = 0; i < 5; i++)
         MoveWindow(hChip[i], PX((float)(71 + i * 45)), PX((float)Y_CHIPS), PX(38), PX(26), TRUE);
-    MoveWindow(hBtnAction, PX(71), PX((float)Y_ACTION), PX(218), PX(48), TRUE);
+    MoveWindow(hBtnAction, PX(71), PX((float)Y_ACTION), PX(218), PX(46), TRUE);
     MoveWindow(hBtnSettings, PX(125), PX((float)Y_SETBTN), PX(110), PX(24), TRUE);
     MoveWindow(hBtnLang, PX(71), PX((float)Y_LANG), PX(218), PX(28), TRUE);
     MoveWindow(hBtnStartup, PX(71), PX((float)Y_START), PX(218), PX(28), TRUE);
 
-    if (hwnd) {
-        int wpx = PX((float)W_BASE), hpx = PX((float)(showSettings ? H_EXP : H_COL));
-        if (reposition && flyoutVisible) {
-            Placement pl = ComputePlacement(wpx, hpx);
-            animTx = pl.x; animTy = pl.y;
-            SetWindowPos(hwnd, HWND_TOPMOST, pl.x, pl.y, wpx, hpx, SWP_NOACTIVATE);
-        } else {
-            SetWindowPos(hwnd, NULL, 0, 0, wpx, hpx, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-        }
-        ApplyRegion(hwnd, wpx, hpx);
-        InvalidateRect(hwnd, NULL, FALSE);
-    }
+    UpdateWindowGeometry(hwnd, reposition);
 }
 
 // =====================================================================
@@ -560,33 +690,42 @@ static void ShowFlyout(bool atCursor) {
         anchorPt.x = mi.rcWork.right - 1;
         anchorPt.y = mi.rcWork.bottom - 1;
     }
+    isExpandingAnim = false;
+    currentBaseH = (float)(showSettings ? H_EXP : H_COL);
     UpdateLayout(hMain, false);
 
-    RECT wr;
-    GetWindowRect(hMain, &wr);
-    Placement pl = ComputePlacement(wr.right - wr.left, wr.bottom - wr.top);
+    int wpx = PX((float)W_BASE), maxH = PX((float)H_EXP), curDoorH = PX(currentBaseH);
+    Placement pl = ComputePlacement(wpx, curDoorH);
     animTx = pl.x; animTy = pl.y; animOffX = pl.offX; animOffY = pl.offY;
 
+    ShowWindow(hBtnLang, showSettings ? SW_SHOW : SW_HIDE);
+    ShowWindow(hBtnStartup, showSettings ? SW_SHOW : SW_HIDE);
+
     flyoutVisible = true;
-    SetLayeredWindowAttributes(hMain, 0, 0, LWA_ALPHA);
-    SetWindowPos(hMain, HWND_TOPMOST, pl.x + pl.offX, pl.y + pl.offY, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetHighResTimer(true);                         // Monitör Hz hızında (144Hz/240Hz) pürüzsüz zamanlayıcı
+    UINT frameMs = GetMonitorFrameIntervalMs();
+
+    SetLayeredWindowAttributes(hMain, COLOR_CHROMA, 0, LWA_ALPHA | LWA_COLORKEY);
+    SetWindowPos(hMain, HWND_TOPMOST, pl.x + pl.offX, pl.y + pl.offY, wpx, maxH, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     SetForegroundWindow(hMain);
     if (!isTimerActive) {
         SetFocus(hInput);
         SendMessageW(hInput, EM_SETSEL, 0, -1);
     }
-    animStart = GetTickCount64();
-    SetTimer(hMain, ID_ANIM_TIMER, 15, NULL);
-    SetTimer(hMain, ID_HOVER_TIMER, 33, NULL);
+    animStartMs = NowMs();
+    SetTimer(hMain, ID_ANIM_TIMER, frameMs, NULL);
+    SetTimer(hMain, ID_HOVER_TIMER, frameMs, NULL);
     Refresh();
 }
 
 static void HideFlyout() {
     if (!flyoutVisible) return;
     flyoutVisible = false;
+    isExpandingAnim = false;
     KillTimer(hMain, ID_ANIM_TIMER);
     KillTimer(hMain, ID_HOVER_TIMER);
     KillTimer(hMain, ID_AUTOHIDE);
+    SetHighResTimer(false);
     if (isDraggingOpacity) { isDraggingOpacity = false; ReleaseCapture(); }
     ShowWindow(hMain, SW_HIDE);
     currentHoverId = 0;
@@ -603,12 +742,14 @@ static void StartProtocol(int minutes) {
     RunShutdown(L"-a");
     remainingSeconds = minutes * 60;
     totalSeconds = remainingSeconds;
+    warnedOneMinute = (remainingSeconds <= 60);
     RunShutdown(L"-s -t " + std::to_wstring(remainingSeconds));
 
     endTime = time(NULL) + remainingSeconds;
     isTimerActive = true;
     currentStatus = 1;
     lastMinutes = minutes;
+    rippleStartMs = NowMs();
     SetTimer(hMain, ID_TIMER, 500, NULL);
     SavePending(true);
     SaveSettings();
@@ -638,6 +779,7 @@ static void StopMellon() {
     KillTimer(hMain, ID_AUTOHIDE);
     isTimerActive = false;
     currentStatus = 2;
+    rippleStartMs = NowMs();
     SavePending(false);
     SendMessageW(hInput, EM_SETREADONLY, FALSE, 0);
     SetWindowTextW(hInput, std::to_wstring(lastMinutes).c_str());
@@ -699,15 +841,90 @@ static void UpdateButtonTexts() {
     SetWindowTextW(hBtnStartup, (Tr(S_STARTUP) + OnOff(isStartupEnabled)).c_str());
 }
 
-static void SetOpacityLayered(HWND hwnd) {
-    SetLayeredWindowAttributes(hwnd, 0, (BYTE)((255 * opacityVal) / 100), LWA_ALPHA);
+// Taş oyma yarı-saydam Ithildin buton çizimi (hem WM_DRAWITEM hem de animasyon sırasındaki önizleme için)
+static void DrawMoriaButtonSurface(HDC dstDC, int xInMain, int yInMain, int bw, int bh,
+                                   const std::wstring& text, HFONT font, COLORREF txtCol,
+                                   float hoverBlend, bool isSelected, bool isSettingsBtn) {
+    RECT rc = { 0, 0, bw, bh };
+
+    // 1. Arka plandaki Moria kaya dokusunu ve Fëanor yıldızı / ağaç ışımasını kopyala ve hafif koyulaştır
+    if (g_artCacheDC && xInMain >= 0 && yInMain >= 0 && xInMain + bw <= g_artCacheW && yInMain + bh <= g_artCacheH) {
+        BitBlt(dstDC, 0, 0, bw, bh, g_artCacheDC, xInMain, yInMain, SRCCOPY);
+        HDC tintDC = CreateCompatibleDC(dstDC);
+        HBITMAP tintBmp = CreateCompatibleBitmap(dstDC, 1, 1);
+        HGDIOBJ oldTint = SelectObject(tintDC, tintBmp);
+        COLORREF tintCol = LerpColor(RGB(8, 14, 20), RGB(20, 42, 62), hoverBlend);
+        SetPixel(tintDC, 0, 0, tintCol);
+        BLENDFUNCTION bf = { AC_SRC_OVER, 0, (BYTE)(170 - (int)(hoverBlend * 35.0f)), 0 };
+        GdiAlphaBlend(dstDC, 0, 0, bw, bh, tintDC, 0, 0, 1, 1, bf);
+        SelectObject(tintDC, oldTint);
+        DeleteObject(tintBmp);
+        DeleteDC(tintDC);
+    } else {
+        COLORREF bgCol = LerpColor(COLOR_BTN_BG, COLOR_HOVER_BG, hoverBlend);
+        BrushScope hb(dstDC, bgCol);
+        FillRect(dstDC, &rc, hb.br);
+    }
+
+    SetBkMode(dstDC, TRANSPARENT);
+    HGDIOBJ oldFont = SelectObject(dstDC, font);
+    SetTextColor(dstDC, txtCol);
+
+    if (isSettingsBtn) {
+        RECT calc = rc;
+        DrawTextW(dstDC, text.c_str(), -1, &calc, DT_SINGLELINE | DT_CALCRECT);
+        int tw = calc.right - calc.left;
+        int total = tw + PX(14);
+        int left = rc.left + ((rc.right - rc.left) - total) / 2;
+        RECT rt = rc; rt.left = left; rt.right = left + tw;
+        DrawTextW(dstDC, text.c_str(), -1, &rt, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+        int tx = left + tw + PX(9), ty = (rc.top + rc.bottom) / 2, a = PX(4);
+        POINT tri[3];
+        if (showSettings) {
+            tri[0] = Pt((float)(tx - a), (float)(ty + a / 2));
+            tri[1] = Pt((float)(tx + a), (float)(ty + a / 2));
+            tri[2] = Pt((float)tx, (float)(ty - a / 2 - 1));
+        } else {
+            tri[0] = Pt((float)(tx - a), (float)(ty - a / 2));
+            tri[1] = Pt((float)(tx + a), (float)(ty - a / 2));
+            tri[2] = Pt((float)tx, (float)(ty + a / 2 + 1));
+        }
+        BrushScope tb(dstDC, txtCol);
+        HGDIOBJ op = SelectObject(dstDC, GetStockObject(NULL_PEN));
+        Polygon(dstDC, tri, 3);
+        SelectObject(dstDC, op);
+    } else if (text.find(L'\n') != std::wstring::npos) {
+        RECT calc = rc;
+        DrawTextW(dstDC, text.c_str(), -1, &calc, DT_CENTER | DT_WORDBREAK | DT_CALCRECT);
+        int th = calc.bottom - calc.top;
+        RECT rd = rc; rd.top += (bh - th) / 2;
+        DrawTextW(dstDC, text.c_str(), -1, &rd, DT_CENTER | DT_WORDBREAK);
+    } else {
+        DrawTextW(dstDC, text.c_str(), -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    // Cüce/Elf pahlı Ithildin çerçevesi ve köşe mücevher vurguları
+    COLORREF border = isSelected ? txtCol : LerpColor(COLOR_MUTED, txtCol, hoverBlend);
+    {
+        PenScope pen(dstDC, 1, border);
+        SelectObject(dstDC, GetStockObject(NULL_BRUSH));
+        Rectangle(dstDC, 0, 0, bw, bh);
+    }
+    if (hoverBlend > 0.05f || isSelected) {
+        COLORREF innerGlow = LerpColor(RGB(25, 45, 65), RGB(80, 165, 210), isSelected ? 0.8f : hoverBlend);
+        PenScope penIn(dstDC, 1, innerGlow);
+        SelectObject(dstDC, GetStockObject(NULL_BRUSH));
+        Rectangle(dstDC, 1, 1, bw - 1, bh - 1);
+    }
+
+    SelectObject(dstDC, oldFont);
 }
 
 // =====================================================================
 //  PENCERE PROSEDÜRÜ
 // =====================================================================
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    static HBRUSH hBgBrush = CreateSolidBrush(COLOR_BG);
+    static HBRUSH hChromaBrush = CreateSolidBrush(COLOR_CHROMA);
     static HBRUSH hInputBrush = CreateSolidBrush(COLOR_BTN_BG);
 
     if (g_msgTaskbarCreated && msg == g_msgTaskbarCreated) {   // Explorer yeniden başladı
@@ -729,14 +946,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             hInput = CreateWindowExW(0, L"EDIT", std::to_wstring(lastMinutes).c_str(), WS_VISIBLE | WS_CHILD | ES_CENTER | ES_AUTOHSCROLL,
                                      0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)ID_INPUT, NULL, NULL);
             SendMessageW(hInput, EM_SETLIMITTEXT, 12, 0);
-            hBtnAction = CreateWindowExW(0, L"BUTTON", L"", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)ID_BTN_ACTION, NULL, NULL);
-            hBtnSettings = CreateWindowExW(0, L"BUTTON", L"", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)ID_BTN_SETTINGS, NULL, NULL);
-            hBtnLang = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | BS_OWNERDRAW, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)ID_BTN_LANG, NULL, NULL);
-            hBtnStartup = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | BS_OWNERDRAW, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)ID_BTN_STARTUP, NULL, NULL);
-            for (int i = 0; i < 5; i++)
-                hChip[i] = CreateWindowExW(0, L"BUTTON", L"", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)(ID_CHIP0 + i), NULL, NULL);
+            hBtnAction = CreateWindowExW(0, L"BUTTON", L"", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW | WS_CLIPSIBLINGS, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)ID_BTN_ACTION, NULL, NULL);
+            hBtnSettings = CreateWindowExW(0, L"BUTTON", L"", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW | WS_CLIPSIBLINGS, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)ID_BTN_SETTINGS, NULL, NULL);
+            hBtnLang = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | BS_OWNERDRAW | WS_CLIPSIBLINGS, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)ID_BTN_LANG, NULL, NULL);
+            hBtnStartup = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | BS_OWNERDRAW | WS_CLIPSIBLINGS, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)ID_BTN_STARTUP, NULL, NULL);
+            for (int i = 0; i < 5; i++) {
+                hChip[i] = CreateWindowExW(0, L"BUTTON", L"", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW | WS_CLIPSIBLINGS, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)(ID_CHIP0 + i), NULL, NULL);
+                SetWindowSubclass(hChip[i], BtnNoFlickerProc, 0, 0);
+            }
+            SetWindowSubclass(hBtnAction, BtnNoFlickerProc, 0, 0);
+            SetWindowSubclass(hBtnSettings, BtnNoFlickerProc, 0, 0);
+            SetWindowSubclass(hBtnLang, BtnNoFlickerProc, 0, 0);
+            SetWindowSubclass(hBtnStartup, BtnNoFlickerProc, 0, 0);
 
-            // Tepsi simgesi (her zaman orada)
             int sm = GetSystemMetrics(SM_CXSMICON);
             if (sm < 16) sm = 16;
             hIconIdle = MakeDoorIcon(sm, COLOR_ITHILDIN);
@@ -750,10 +972,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             UpdateLayout(hwnd, false);
             UpdateButtonTexts();
 
-            // Önceki oturumdan kalan geri sayım varsa devam et
+            // Statik kapı mimarisi önbelleğini başlangıçta ısıt (ilk açılışta 0 gecikme)
+            {
+                HDC hs = GetDC(NULL);
+                EnsureArtCache(hs, PX((float)W_BASE), PX((float)H_EXP), g_s);
+                ReleaseDC(NULL, hs);
+            }
+
             if (LoadPending()) {
                 isTimerActive = true;
                 currentStatus = 1;
+                warnedOneMinute = (remainingSeconds <= 60);
                 RunShutdown(L"-a");
                 RunShutdown(L"-s -t " + std::to_wstring(remainingSeconds));
                 SendMessageW(hInput, EM_SETREADONLY, TRUE, 0);
@@ -802,6 +1031,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         remainingSeconds = left;
                         UpdateStatusText();
                         UpdateTray();
+                        if (remainingSeconds <= 60 && !warnedOneMinute) {
+                            warnedOneMinute = true;
+                            ShowTrayBalloon(Tr(S_WARN_TITLE), Tr(S_WARN_MSG));
+                        }
                     }
                 } else {
                     KillTimer(hwnd, ID_TIMER);
@@ -817,22 +1050,68 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             else if (wp == ID_HOVER_TIMER) {
                 if (!flyoutVisible) break;
+                double now = NowMs();
+
+                // 1. Ayarlar açılış/kapanış animasyonu (DWM SetWindowRgn çağrısı olmadan, tam monitör Hz hızında!)
+                if (isExpandingAnim) {
+                    double t = (now - expandStartMs) / 190.0;
+                    if (t >= 1.0) {
+                        t = 1.0;
+                        isExpandingAnim = false;
+                        currentBaseH = expandToH;
+                        int wpx = PX((float)W_BASE), curDoorH = PX(currentBaseH);
+                        Placement pl = ComputePlacement(wpx, curDoorH);
+                        animTx = pl.x; animTy = pl.y;
+                        SetWindowPos(hwnd, NULL, pl.x, pl.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                        if (showSettings) {
+                            ShowWindow(hBtnLang, SW_SHOW);
+                            ShowWindow(hBtnStartup, SW_SHOW);
+                            InvalidateRect(hBtnLang, NULL, FALSE);
+                            InvalidateRect(hBtnStartup, NULL, FALSE);
+                        }
+                    } else {
+                        // Smootherstep / cubic ease-out
+                        float u = 1.0f - (float)t;
+                        float e = 1.0f - u * u * u;
+                        currentBaseH = expandFromH + (expandToH - expandFromH) * e;
+                        int wpx = PX((float)W_BASE), curDoorH = PX(currentBaseH);
+                        Placement pl = ComputePlacement(wpx, curDoorH);
+                        animTx = pl.x; animTy = pl.y;
+                        SetWindowPos(hwnd, NULL, pl.x, pl.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                    }
+                }
+
+                // 2. Buton yumuşak hover geçişi
                 POINT pt; GetCursorPos(&pt); ScreenToClient(hwnd, &pt);
                 HWND hHover = ChildWindowFromPointEx(hwnd, pt, CWP_SKIPINVISIBLE);
                 int id = (hHover && hHover != hwnd) ? GetDlgCtrlID(hHover) : 0;
-                if (id != currentHoverId) {
-                    HWND hOld = currentHoverId ? GetDlgItem(hwnd, currentHoverId) : NULL;
-                    if (hOld) InvalidateRect(hOld, NULL, FALSE);
-                    currentHoverId = id;
-                    if (hHover && hHover != hwnd) InvalidateRect(hHover, NULL, FALSE);
+                currentHoverId = id;
+
+                const int allIds[9] = {
+                    ID_BTN_ACTION, ID_BTN_SETTINGS, ID_BTN_LANG, ID_BTN_STARTUP,
+                    ID_CHIP0, ID_CHIP0 + 1, ID_CHIP0 + 2, ID_CHIP0 + 3, ID_CHIP0 + 4
+                };
+                for (int i = 0; i < 9; i++) {
+                    int cid = allIds[i];
+                    int slot = HoverSlot(cid);
+                    if (slot < 0) continue;
+                    float target = (cid == currentHoverId) ? 1.0f : 0.0f;
+                    float diff = target - btnHoverBlend[slot];
+                    if (fabsf(diff) > 0.005f) {
+                        btnHoverBlend[slot] += diff * 0.25f;
+                        if (fabsf(target - btnHoverBlend[slot]) < 0.01f) btnHoverBlend[slot] = target;
+                        HWND hc = GetDlgItem(hwnd, cid);
+                        if (hc && IsWindowVisible(hc)) InvalidateRect(hc, NULL, FALSE);
+                    }
                 }
-                InvalidateRect(hwnd, NULL, FALSE);      // ithildin animasyonu
+                InvalidateRect(hwnd, NULL, FALSE);
+                UpdateWindow(hwnd);                     // Monitör Hz hızında anında çizim
             }
             else if (wp == ID_ANIM_TIMER) {
-                double t = (double)(GetTickCount64() - animStart) / 180.0;
+                double t = (NowMs() - animStartMs) / 180.0;
                 if (t >= 1.0) { t = 1.0; KillTimer(hwnd, ID_ANIM_TIMER); }
                 float e = 1.0f - powf(1.0f - (float)t, 3.0f);
-                SetLayeredWindowAttributes(hwnd, 0, (BYTE)(((255 * opacityVal) / 100) * e), LWA_ALPHA);
+                SetLayeredWindowAttributes(hwnd, COLOR_CHROMA, (BYTE)(((255 * opacityVal) / 100) * e), LWA_ALPHA | LWA_COLORKEY);
                 SetWindowPos(hwnd, NULL, animTx + (int)((1.0f - e) * animOffX), animTy + (int)((1.0f - e) * animOffY),
                              0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
             }
@@ -892,41 +1171,55 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             RECT rcClient;
             GetClientRect(hwnd, &rcClient);
+            int clientW = rcClient.right, clientH = rcClient.bottom;
             HDC hdc = CreateCompatibleDC(hdcWindow);
-            HBITMAP hBmp = CreateCompatibleBitmap(hdcWindow, rcClient.right, rcClient.bottom);
+            HBITMAP hBmp = CreateCompatibleBitmap(hdcWindow, clientW, clientH);
             HGDIOBJ oldBmp = SelectObject(hdc, hBmp);
             HGDIOBJ origFont = GetCurrentObject(hdc, OBJ_FONT);
 
-            FillRect(hdc, &rcClient, hBgBrush);
+            // 0. Önce tüm arka tamponu DWM şeffaf anahtar rengiyle (COLOR_CHROMA) doldur
+            FillRect(hdc, &rcClient, hChromaBrush);
+
+            // Bellek DC üzerinde aktif kapı yüksekliğine (currentBaseH) göre kemer kırpması uygula
+            int curDoorH = PX(currentBaseH);
+            HRGN hDoorClip = CreateDoorClipRgn(clientW, curDoorH);
+            SelectClipRgn(hdc, hDoorClip);
+
+            // 1. Önbellekli statik film kapısı mimarisini 0.03ms'de kopyala
+            int maxCacheH = PX((float)H_EXP);
+            EnsureArtCache(hdcWindow, clientW, maxCacheH, s);
+            BitBlt(hdc, 0, 0, clientW, curDoorH, g_artCacheDC, 0, 0, SRCCOPY);
+
             SetBkMode(hdc, TRANSPARENT);
             SelectObject(hdc, GetStockObject(NULL_BRUSH));
 
-            double timeMs = (double)GetTickCount64();
-            double pulse = 0.65 + 0.35 * sin(timeMs * 0.0025);
-            COLORREF auraGlow  = RGB((int)(15 * pulse), (int)(30 * pulse), (int)(45 * pulse));
-            COLORREF outerGlow = RGB((int)(40 * pulse), (int)(80 * pulse), (int)(110 * pulse));
-            COLORREF midGlow   = RGB((int)(80 * pulse), (int)(150 * pulse), (int)(190 * pulse));
-            COLORREF coreGlow  = RGB((int)(135 * pulse), (int)(225 * pulse), (int)(255 * pulse));
-            COLORREF crispGlow = RGB(200, 245, 255);
+            double timeMs = NowMs();
+            double pulse = 0.72 + 0.28 * sin(timeMs * 0.0025);
 
-            float baseH = (float)(showSettings ? H_EXP : H_COL);
-            float x1 = 6 * s, x2 = (W_BASE - 6) * s;
-            float yArcTop = 6 * s;
-            float arcW = x2 - x1;
-            float yArcMid = yArcTop + arcW / 2;
-            float yBottom = (baseH - 6) * s;
-            float cxF = (x1 + x2) / 2.0f;
-
-            // --- Arkada çok soluk büyük sekiz köşeli yıldız
-            {
-                COLORREF dim = RGB((int)(20 * pulse), (int)(40 * pulse), (int)(56 * pulse));
-                PenScope p(hdc, 1, dim);
-                DrawStarShape(hdc, cxF, 255 * s, 92 * s, 38 * s, 8, -1.5707963f);
-                Ellipse(hdc, (int)(cxF - 62 * s), (int)(255 * s - 62 * s), (int)(cxF + 62 * s), (int)(255 * s + 62 * s));
+            double rippleBoost = 0.0;
+            if (rippleStartMs > 0.0) {
+                double elapsed = (timeMs - rippleStartMs) / 900.0;
+                if (elapsed < 1.0) rippleBoost = sin(elapsed * PI_F) * 0.35;
+                else rippleStartMs = 0.0;
             }
+            double pGlow = pulse + rippleBoost;
+            if (pGlow > 1.15) pGlow = 1.15;
 
-            // --- Kapı çerçevesi (çok katmanlı ithildin parıltısı)
-            auto DrawDoor = [&](float inset, int pw, COLORREF col) {
+            auto cClamp = [](double v) -> BYTE { return (BYTE)(v < 0 ? 0 : (v > 255 ? 255 : v)); };
+            COLORREF auraGlow  = RGB(cClamp(15 * pGlow), cClamp(34 * pGlow), cClamp(52 * pGlow));
+            COLORREF outerGlow = RGB(cClamp(42 * pGlow), cClamp(88 * pGlow), cClamp(122 * pGlow));
+            COLORREF midGlow   = RGB(cClamp(84 * pGlow), cClamp(165 * pGlow), cClamp(212 * pGlow));
+            COLORREF coreGlow  = RGB(cClamp(145 * pGlow), cClamp(230 * pGlow), cClamp(255 * pGlow));
+            COLORREF crispGlow = RGB(220, 248, 255);
+
+            float baseH = currentBaseH;
+            float x1 = 4.0f * s, x2 = (W_BASE - 4.0f) * s;
+            float yArcTop = 4.0f * s;
+            float yBottom = (baseH - 4.0f) * s;
+            float cxF = (W_BASE * 0.5f) * s;
+
+            // 2. Dış taş kemer silüeti ve alt eşik Ithildin çizgisi
+            auto DrawOuterRim = [&](float inset, int pw, COLORREF col) {
                 PenScope p(hdc, pw, col);
                 float ax1 = x1 + inset, ax2 = x2 - inset, aTop = yArcTop + inset, aBot = yBottom - inset;
                 float aw = ax2 - ax1, aMid = aTop + aw / 2;
@@ -935,24 +1228,33 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 MoveToEx(hdc, (int)ax1, (int)aBot, NULL); LineTo(hdc, (int)ax2, (int)aBot);
                 Arc(hdc, (int)ax1, (int)aTop, (int)ax2, (int)(aTop + aw), (int)ax2, (int)aMid, (int)ax1, (int)aMid);
             };
-            DrawDoor(0, (int)(12 * s), auraGlow);
-            DrawDoor(0, (int)(7 * s), outerGlow);
-            DrawDoor(0, (int)(4 * s), midGlow);
-            DrawDoor(0, (int)(2 * s), coreGlow);
-            DrawDoor(0, 1, crispGlow);
-            DrawDoor(16 * s, 1, COLOR_MUTED);
+            DrawOuterRim(0, (int)(8 * s), auraGlow);
+            DrawOuterRim(0, (int)(4 * s), outerGlow);
+            DrawOuterRim(0, (int)(2 * s), midGlow);
+            DrawOuterRim(0, 1, coreGlow);
 
-            // --- Elfçe yazıt, ağaçlar, amblem
-            DrawInscription(hdc, s, x1, x2, yArcMid, yBottom, midGlow);
-            float treeBaseY = yBottom - 6 * s;
-            float trunk = treeBaseY - 300 * s;
-            DrawTree(hdc, 46 * s, treeBaseY, 1.0f, trunk, s, midGlow, coreGlow);
-            DrawTree(hdc, (W_BASE - 46) * s, treeBaseY, -1.0f, trunk, s, midGlow, coreGlow);
-            DrawEmblem(hdc, s, cxF, yArcMid, timeMs, outerGlow, crispGlow, 134.0f, 56.0f, 100.0f);
+            // Alt sütun kaideleri ve eşik çizgisi (currentBaseH ile birlikte pürüzsüzce kayar)
+            {
+                PenScope pMid(hdc, (int)(3 * s), midGlow);
+                MoveToEx(hdc, PX(30), (int)(yBottom - 3.0f * s), NULL);
+                LineTo(hdc, PX(W_BASE - 30), (int)(yBottom - 3.0f * s));
+                PenScope pCore(hdc, 1, crispGlow);
+                MoveToEx(hdc, PX(30), (int)(yBottom - 3.0f * s), NULL);
+                LineTo(hdc, PX(W_BASE - 30), (int)(yBottom - 3.0f * s));
+            }
+
+            // 3. Saat yönünde kesintisiz dönen dış Tengwar rünleri (sol koridordan yukarı -> kemerden sağa -> sağ koridordan aşağı)
+            DrawFlowingInscriptionFastGDI(hdc, s, x1, x2, 176.0f * s, yBottom, timeMs, midGlow, coreGlow);
+
+            // 4. Durin'in Tacı etrafındaki 7 Yıldızın canlı parıltısı (filmdeki yay konumunda: starR = 108.0f)
+            DrawSevenStarsFastGDI(hdc, s, cxF, 162.0f * s, timeMs, midGlow, crispGlow, 108.0f);
+
+            // 5. Alt eşik üzerindeki "C / J" usta mührü (kapı boyuyla birlikte hareket eder, butonlarla çakışmaz)
+            DrawMakerMarkFastGDI(hdc, s, cxF, yBottom - 20.0f * s, midGlow, coreGlow);
 
             // --- Başlık (kayan parıltı ile)
             SelectObject(hdc, hFontTitle);
-            RECT rTitle = { 0, PX((float)Y_TITLE), PX((float)W_BASE), PX((float)Y_TITLE + 44) };
+            RECT rTitle = { 0, PX((float)Y_TITLE), PX((float)W_BASE), PX((float)Y_TITLE + 40) };
             std::wstring titleStr = L"M.O.R.I.A.";
             SIZE sz;
             GetTextExtentPoint32W(hdc, titleStr.c_str(), (int)titleStr.length(), &sz);
@@ -964,25 +1266,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             BeginPath(hdc);
             TextOutW(hdc, textX, textY, titleStr.c_str(), (int)titleStr.length());
             EndPath(hdc);
-            HRGN hClip = PathToRegion(hdc);
-            if (hClip) {
-                SelectClipRgn(hdc, hClip);
+            HRGN hClipTitle = PathToRegion(hdc);
+            if (hClipTitle) {
+                CombineRgn(hClipTitle, hClipTitle, hDoorClip, RGN_AND);
+                SelectClipRgn(hdc, hClipTitle);
                 double phase = fmod(timeMs, 3000.0) / 3000.0;
                 int sx = (int)(-60 * s + phase * 480 * s);
                 POINT pts[4] = {
                     Pt((float)(sx + 25 * s), (float)rTitle.top), Pt((float)(sx + 45 * s), (float)rTitle.top),
                     Pt((float)(sx - 15 * s), (float)rTitle.bottom), Pt((float)(sx - 35 * s), (float)rTitle.bottom)
                 };
-                BrushScope br(hdc, RGB(220, 250, 255));
+                BrushScope br(hdc, RGB(230, 252, 255));
                 HGDIOBJ oldPen = SelectObject(hdc, GetStockObject(NULL_PEN));
                 Polygon(hdc, pts, 4);
                 SelectObject(hdc, oldPen);
-                SelectClipRgn(hdc, NULL);
-                DeleteObject(hClip);
+                SelectClipRgn(hdc, hDoorClip);
+                DeleteObject(hClipTitle);
             }
 
             // --- Alt başlık
-            SetTextColor(hdc, COLOR_MUTED);
+            SetTextColor(hdc, RGB(135, 195, 228));
             SelectObject(hdc, hFontSmall);
             {
                 std::wstring sub = Tr(S_SUB);
@@ -998,7 +1301,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 COLORREF tc = isTimerActive ? ((remainingSeconds <= 60) ? COLOR_RED : COLOR_ITHILDIN) : COLOR_TEXT;
                 SelectObject(hdc, hFontTime);
                 RECT r = { 0, PX((float)Y_TIME), PX((float)W_BASE), PX((float)Y_TIME + 52) };
-                if (isTimerActive) {            // hafif parıltı
+                if (isTimerActive) {
                     SetTextColor(hdc, outerGlow);
                     RECT r1 = r; OffsetRect(&r1, -1, 0); DrawTextW(hdc, tmStr.c_str(), -1, &r1, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
                     RECT r2 = r; OffsetRect(&r2, 1, 0);  DrawTextW(hdc, tmStr.c_str(), -1, &r2, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
@@ -1009,7 +1312,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             // --- "Kapılar kapanıyor" ilerleme çubuğu
             {
-                int bx1 = PX(71), bx2 = PX(289), by = PX((float)Y_BAR);
+                int bx1 = PX(84), bx2 = PX(276), by = PX((float)Y_BAR);
                 {
                     PenScope p(hdc, (int)(3 * s), COLOR_BTN_BG);
                     MoveToEx(hdc, bx1, by, NULL); LineTo(hdc, bx2, by);
@@ -1040,33 +1343,51 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else SetTextColor(hdc, COLOR_TEXT);
             SelectObject(hdc, hFontMed);
             {
-                RECT r = { PX(20), PX((float)Y_STATUS), PX((float)W_BASE - 20), PX((float)Y_STATUS + 24) };
+                RECT r = { PX(58), PX((float)Y_STATUS), PX((float)W_BASE - 58), PX((float)Y_STATUS + 24) };
                 DrawTextW(hdc, statusText.c_str(), -1, &r, DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             }
 
-            // --- Dakika etiketi + giriş kutusunun altındaki çizgi
-            SetTextColor(hdc, COLOR_MUTED);
+            // --- Dakika etiketi + Fëanor yıldızı üzerindeki giriş kutusunun mücevher çerçevesi
+            SetTextColor(hdc, RGB(145, 205, 235));
             SelectObject(hdc, hFontSmall);
             {
                 std::wstring lbl = Tr(S_MINLABEL);
-                RECT r = { 0, PX((float)Y_LABEL), PX((float)W_BASE), PX((float)Y_LABEL + 18) };
+                RECT r = { PX(58), PX((float)Y_LABEL), PX((float)W_BASE - 58), PX((float)Y_LABEL + 18) };
                 DrawTextW(hdc, lbl.c_str(), -1, &r, DT_CENTER | DT_SINGLELINE);
                 PenScope p(hdc, 1, isTimerActive ? COLOR_MUTED : COLOR_ITHILDIN);
-                MoveToEx(hdc, PX(130), PX((float)Y_EDIT + 31), NULL);
-                LineTo(hdc, PX(230), PX((float)Y_EDIT + 31));
+                SelectObject(hdc, GetStockObject(NULL_BRUSH));
+                Rectangle(hdc, PX(143), PX((float)Y_EDIT - 1), PX(217), PX((float)Y_EDIT + 27));
             }
 
-            // --- Ayarlar bölümü
-            if (showSettings) {
+            // --- Ayarlar bölümü (veya açılış/kapanış animasyonu sırasında pürüzsüz kırpılmış önizleme)
+            if (showSettings || currentBaseH > H_COL + 1.0f) {
                 {
                     PenScope p(hdc, 1, COLOR_MUTED);
                     MoveToEx(hdc, PX(100), PX((float)Y_SEP), NULL);
                     LineTo(hdc, PX(260), PX((float)Y_SEP));
                 }
+
+                // Animasyon sürerken gerçek buton HWND'leri gizliyse, birebir aynı taş oyma yüzeyle çiz
+                if (!IsWindowVisible(hBtnLang)) {
+                    auto drawGhostBtn = [&](int yBase, const std::wstring& btxt) {
+                        int bx = PX(71), by = PX((float)yBase), bw = PX(218), bh = PX(28);
+                        HDC bDC = CreateCompatibleDC(hdc);
+                        HBITMAP bBmp = CreateCompatibleBitmap(hdcWindow, bw, bh);
+                        HGDIOBJ oldB = SelectObject(bDC, bBmp);
+                        DrawMoriaButtonSurface(bDC, bx, by, bw, bh, btxt, hFontSmall, COLOR_TEXT, 0.0f, false, false);
+                        BitBlt(hdc, bx, by, bw, bh, bDC, 0, 0, SRCCOPY);
+                        SelectObject(bDC, oldB);
+                        DeleteObject(bBmp);
+                        DeleteDC(bDC);
+                    };
+                    drawGhostBtn(Y_LANG, Tr(S_LANG));
+                    drawGhostBtn(Y_START, Tr(S_STARTUP) + OnOff(isStartupEnabled));
+                }
+
                 SelectObject(hdc, hFontSmall);
                 SetTextColor(hdc, COLOR_TEXT);
                 std::wstring opTxt = Tr(S_OPACITY) + PercentText(opacityVal);
-                RECT rOp = { 0, PX((float)Y_OPLBL), PX((float)W_BASE), PX((float)Y_OPLBL + 20) };
+                RECT rOp = { PX(58), PX((float)Y_OPLBL), PX((float)W_BASE - 58), PX((float)Y_OPLBL + 20) };
                 DrawTextW(hdc, opTxt.c_str(), -1, &rOp, DT_CENTER | DT_SINGLELINE);
 
                 int ty = PX((float)Y_OPSLIDER);
@@ -1077,14 +1398,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 float opP = (opacityVal - 30) / 70.0f;
                 int opCx = (int)(PX(80) + opP * PX(200));
                 {
+                    PenScope pGlowLine(hdc, 2, coreGlow);
+                    MoveToEx(hdc, PX(80), ty, NULL); LineTo(hdc, opCx, ty);
+                }
+                {
                     PenScope p(hdc, 1, crispGlow);
                     BrushScope b(hdc, COLOR_ITHILDIN);
                     Ellipse(hdc, opCx - PX(7), ty - PX(7), opCx + PX(7), ty + PX(7));
                 }
             }
 
+            SelectClipRgn(hdc, NULL);
+            DeleteObject(hDoorClip);
+
             SelectObject(hdc, origFont);
-            BitBlt(hdcWindow, 0, 0, rcClient.right, rcClient.bottom, hdc, 0, 0, SRCCOPY);
+            BitBlt(hdcWindow, 0, 0, clientW, clientH, hdc, 0, 0, SRCCOPY);
             SelectObject(hdc, oldBmp);
             DeleteObject(hBmp);
             DeleteDC(hdc);
@@ -1097,7 +1425,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int id = (int)d->CtlID;
             bool chip = (id >= ID_CHIP0 && id < ID_CHIP0 + 5);
             bool chipOff = chip && isTimerActive;
-            bool hov = (id == currentHoverId) && !chipOff;
+            int slot = HoverSlot(id);
+            float blend = (slot >= 0 && !chipOff) ? btnHoverBlend[slot] : 0.0f;
             bool chipSel = false;
             if (chip) {
                 bool mel = false;
@@ -1105,11 +1434,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 chipSel = (!mel && curMin == PRESETS[id - ID_CHIP0]);
             }
 
-            HBRUSH hb = CreateSolidBrush(hov ? COLOR_HOVER_BG : COLOR_BTN_BG);
-            FillRect(d->hDC, &d->rcItem, hb);
-            DeleteObject(hb);
-            SetBkMode(d->hDC, TRANSPARENT);
-            HGDIOBJ oldFont = SelectObject(d->hDC, chip ? hFontChip : hFontSmall);
+            int bw = d->rcItem.right - d->rcItem.left;
+            int bh = d->rcItem.bottom - d->rcItem.top;
+            POINT ptMain = { 0, 0 };
+            MapWindowPoints(d->hwndItem, hwnd, &ptMain, 1);
+
+            HDC memDC = CreateCompatibleDC(d->hDC);
+            HBITMAP memBmp = CreateCompatibleBitmap(d->hDC, bw, bh);
+            HGDIOBJ oldBmp = SelectObject(memDC, memBmp);
 
             COLORREF txt = COLOR_TEXT;
             std::wstring text;
@@ -1119,45 +1451,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else if (id == ID_BTN_STARTUP) { text = Tr(S_STARTUP) + OnOff(isStartupEnabled); }
             else if (chip) {
                 text = std::to_wstring(PRESETS[id - ID_CHIP0]) + L" " + Tr(S_UNIT);
-                txt = chipOff ? COLOR_MUTED : (chipSel ? COLOR_ITHILDIN : COLOR_TEXT);
-            }
-            SetTextColor(d->hDC, txt);
-
-            RECT rc = d->rcItem;
-            if (id == ID_BTN_SETTINGS) {
-                RECT calc = rc;
-                DrawTextW(d->hDC, text.c_str(), -1, &calc, DT_SINGLELINE | DT_CALCRECT);
-                int tw = calc.right - calc.left;
-                int total = tw + PX(14);
-                int left = rc.left + ((rc.right - rc.left) - total) / 2;
-                RECT rt = rc; rt.left = left; rt.right = left + tw;
-                DrawTextW(d->hDC, text.c_str(), -1, &rt, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
-                int tx = left + tw + PX(9), ty = (rc.top + rc.bottom) / 2, a = PX(4);
-                POINT tri[3];
-                if (showSettings) { tri[0] = Pt((float)(tx - a), (float)(ty + a / 2)); tri[1] = Pt((float)(tx + a), (float)(ty + a / 2)); tri[2] = Pt((float)tx, (float)(ty - a / 2 - 1)); }
-                else { tri[0] = Pt((float)(tx - a), (float)(ty - a / 2)); tri[1] = Pt((float)(tx + a), (float)(ty - a / 2)); tri[2] = Pt((float)tx, (float)(ty + a / 2 + 1)); }
-                HBRUSH tb = CreateSolidBrush(txt);
-                HGDIOBJ ob = SelectObject(d->hDC, tb);
-                HGDIOBJ op = SelectObject(d->hDC, GetStockObject(NULL_PEN));
-                Polygon(d->hDC, tri, 3);
-                SelectObject(d->hDC, op); SelectObject(d->hDC, ob); DeleteObject(tb);
-            } else if (text.find(L'\n') != std::wstring::npos) {
-                RECT calc = rc;
-                DrawTextW(d->hDC, text.c_str(), -1, &calc, DT_CENTER | DT_WORDBREAK | DT_CALCRECT);
-                int th = calc.bottom - calc.top, bh = rc.bottom - rc.top;
-                RECT rd = rc; rd.top += (bh - th) / 2;
-                DrawTextW(d->hDC, text.c_str(), -1, &rd, DT_CENTER | DT_WORDBREAK);
-            } else {
-                DrawTextW(d->hDC, text.c_str(), -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                txt = chipOff ? COLOR_MUTED : (chipSel ? COLOR_ITHILDIN : LerpColor(COLOR_TEXT, COLOR_ITHILDIN, blend));
             }
 
-            COLORREF border = (hov || chipSel) ? txt : COLOR_MUTED;
-            HPEN pen = CreatePen(PS_SOLID, 1, border);
-            HGDIOBJ op = SelectObject(d->hDC, pen);
-            HGDIOBJ ob = SelectObject(d->hDC, GetStockObject(NULL_BRUSH));
-            Rectangle(d->hDC, d->rcItem.left, d->rcItem.top, d->rcItem.right, d->rcItem.bottom);
-            SelectObject(d->hDC, ob); SelectObject(d->hDC, op); DeleteObject(pen);
-            SelectObject(d->hDC, oldFont);
+            DrawMoriaButtonSurface(memDC, ptMain.x, ptMain.y, bw, bh,
+                                   text, chip ? hFontChip : hFontSmall, txt,
+                                   blend, chipSel, id == ID_BTN_SETTINGS);
+
+            BitBlt(d->hDC, d->rcItem.left, d->rcItem.top, bw, bh, memDC, 0, 0, SRCCOPY);
+            SelectObject(memDC, oldBmp);
+            DeleteObject(memBmp);
+            DeleteDC(memDC);
             return TRUE;
         }
 
@@ -1184,7 +1488,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         StopMellon();
                     } else {
                         StartProtocol(m);
-                        SetTimer(hwnd, ID_AUTOHIDE, 1800, NULL);    // onayı göster, sonra paneli kapat
+                        SetTimer(hwnd, ID_AUTOHIDE, 1800, NULL);
                     }
                 } else {
                     CancelProtocol();
@@ -1199,10 +1503,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             else if (id == ID_BTN_SETTINGS) {
                 showSettings = !showSettings;
-                ShowWindow(hBtnLang, showSettings ? SW_SHOW : SW_HIDE);
-                ShowWindow(hBtnStartup, showSettings ? SW_SHOW : SW_HIDE);
-                UpdateLayout(hwnd, true);
-                Refresh();
+                expandFromH = currentBaseH;
+                expandToH = (float)(showSettings ? H_EXP : H_COL);
+                expandStartMs = NowMs();
+                isExpandingAnim = true;
+
+                ShowWindow(hBtnLang, SW_HIDE);
+                ShowWindow(hBtnStartup, SW_HIDE);
+                InvalidateRect(hBtnSettings, NULL, FALSE);
             }
             else if (id == ID_BTN_LANG) {
                 isEnglish = !isEnglish; SaveSettings();
@@ -1217,18 +1525,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_TRAYICON: {
             if (lp == WM_LBUTTONUP) {
                 if (flyoutVisible) HideFlyout();
-                else if (GetTickCount64() - lastHideTick > 400) ShowFlyout(true);   // tıklama paneli zaten kapattıysa tekrar açma
+                else if (GetTickCount64() - lastHideTick > 400) ShowFlyout(true);
             } else if (lp == WM_RBUTTONUP) {
                 ShowTrayMenu();
+            } else if (lp == NIN_BALLOONUSERCLICK) {
+                ShowFlyout(false);
             }
             break;
         }
 
         case WM_DESTROY: {
+            SetHighResTimer(false);
             RemoveFontResourceExW(fontPath.c_str(), FR_PRIVATE, 0);
             KillTimer(hwnd, ID_TIMER);
             KillTimer(hwnd, ID_HOVER_TIMER);
             KillTimer(hwnd, ID_ANIM_TIMER);
+            FreeArtCache();
             Shell_NotifyIconW(NIM_DELETE, &nid);
             if (hIconIdle) DestroyIcon(hIconIdle);
             if (hIconActive) DestroyIcon(hIconActive);
@@ -1239,7 +1551,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (hFontMed) DeleteObject(hFontMed);
             if (hFontSmall) DeleteObject(hFontSmall);
             if (hFontChip) DeleteObject(hFontChip);
-            DeleteObject(hBgBrush); DeleteObject(hInputBrush);
+            DeleteObject(hChromaBrush); DeleteObject(hInputBrush);
             PostQuitMessage(0);
             break;
         }
@@ -1252,7 +1564,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 //  GİRİŞ NOKTASI
 // =====================================================================
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
-    // Tek örnek: ikinci çalıştırma mevcut paneli açar
+    (void)hPrevInstance; (void)lpCmdLine; (void)nCmdShow;
     HANDLE hMutex = CreateMutexW(NULL, TRUE, L"Local\\MORIA.SingleInstance");
     if (hMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
         HWND hOther = FindWindowW(L"MoriaFlyoutClass", NULL);
@@ -1263,6 +1575,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         CloseHandle(hMutex);
         return 0;
     }
+
+    Gdiplus::GdiplusStartupInput gdiplusStartupInput;
+    ULONG_PTR gdiplusToken = 0;
+    Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
+
+    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES };
+    InitCommonControlsEx(&icc);
 
     SetProcessDPIAware();
     HDC hScreen = GetDC(NULL);
@@ -1293,32 +1612,33 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wc.hbrBackground = NULL;
     wc.hIcon = hIconBig;
     wc.hIconSm = hIconBig;
-    if (!RegisterClassExW(&wc)) return 0;
+    if (!RegisterClassExW(&wc)) {
+        Gdiplus::GdiplusShutdown(gdiplusToken);
+        return 0;
+    }
 
-    // Görev çubuğu/Alt+Tab'da görünmeyen, üstte duran, kenarlıksız panel
     HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED,
                                 L"MoriaFlyoutClass", L"M.O.R.I.A. - Doors of Durin",
                                 WS_POPUP | WS_CLIPCHILDREN,
-                                0, 0, W_BASE, H_COL, NULL, NULL, hInstance, NULL);
-    if (!hwnd) return 0;
+                                0, 0, W_BASE, H_EXP, NULL, NULL, hInstance, NULL);
+    if (!hwnd) {
+        Gdiplus::GdiplusShutdown(gdiplusToken);
+        return 0;
+    }
 
     if (!trayOnly) ShowFlyout(false);
 
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0) > 0) {
-        if (msg.message == WM_KEYDOWN) {
-            if (msg.wParam == VK_RETURN && msg.hwnd == hInput && !isTimerActive) {      // Enter: protokolü başlat
-                SendMessageW(hMain, WM_COMMAND, MAKEWPARAM(ID_BTN_ACTION, BN_CLICKED), (LPARAM)hBtnAction);
-                continue;
-            }
-            if (msg.wParam == VK_ESCAPE && flyoutVisible) {            // Esc: paneli kapat
-                HideFlyout();
-                continue;
-            }
+        if (msg.message == WM_KEYDOWN && flyoutVisible) {
+            if (msg.wParam == VK_ESCAPE) { HideFlyout(); continue; }
+            if (msg.wParam == VK_RETURN) { SendMessageW(hwnd, WM_COMMAND, ID_BTN_ACTION, 0); continue; }
         }
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
+
+    Gdiplus::GdiplusShutdown(gdiplusToken);
     if (hMutex) CloseHandle(hMutex);
     return (int)msg.wParam;
 }
